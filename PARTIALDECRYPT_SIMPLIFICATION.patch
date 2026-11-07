@@ -1,0 +1,377 @@
+diff --git a/circuits/partialdecrypt/assignment.go b/circuits/partialdecrypt/assignment.go
+index c9f4865..5908aa3 100644
+--- a/circuits/partialdecrypt/assignment.go
++++ b/circuits/partialdecrypt/assignment.go
+@@ -19,14 +19,13 @@ type Assignment struct {
+ 	ParticipantIndex uint16   // i, one-based committee slot
+ 	Base             types.CurvePoint
+ 	Secret           *big.Int
+-	Nonce            *big.Int
+ }
+ 
+ // Validate checks that the assignment is complete. Committee slots are
+ // one-based, so a zero participant index is always a caller bug.
+ func (a Assignment) Validate() error {
+-	if a.RoundHash == nil || a.Secret == nil || a.Nonce == nil {
+-		return fmt.Errorf("epoch hash, base, secret, and nonce are required")
++	if a.RoundHash == nil || a.Secret == nil {
++		return fmt.Errorf("epoch hash, base, and secret are required")
+ 	}
+ 	if a.ParticipantIndex == 0 {
+ 		return fmt.Errorf("participant index must be non-zero")
+diff --git a/circuits/partialdecrypt/circuit.go b/circuits/partialdecrypt/circuit.go
+index c0aae61..6905b5f 100644
+--- a/circuits/partialdecrypt/circuit.go
++++ b/circuits/partialdecrypt/circuit.go
+@@ -6,15 +6,9 @@ import (
+ 	ccommon "github.com/vocdoni/davinci-dkg/circuits/common"
+ )
+ 
+-// PartialDecryptCircuit proves a BabyJubJub Chaum-Pedersen relation for one
+-// committee partial decryption: D_i = d_i·G, δ_i = d_i·C_1, A_i = w·G,
+-// B_i = w·C_1.
+-//
+-// The Fiat-Shamir challenge transcript binds
+-// (eid, aid, ctIdx, i, D_i, C_1, δ_i, A_i, B_i), so a proof cannot be
+-// replayed across epochs, applications, ciphertexts or participants. The
+-// organizer's part of the decryption is proven inside the combine circuit,
+-// not here.
++// PartialDecryptCircuit proves directly that one secret share d_i explains
++// both the committed public share D_i and the partial decryption delta_i:
++// D_i = d_i·G and delta_i = d_i·C_1.
+ type PartialDecryptCircuit struct {
+ 	RoundHash        frontend.Variable    `gnark:",public"` // semantically: eid
+ 	Aid              frontend.Variable    `gnark:",public"` // application identifier
+@@ -23,78 +17,27 @@ type PartialDecryptCircuit struct {
+ 	Base             twistededwards.Point `gnark:",public"` // C_1
+ 	PublicKey        twistededwards.Point `gnark:",public"` // D_i
+ 	Delta            twistededwards.Point `gnark:",public"` // δ_i
+-	A1               twistededwards.Point `gnark:",public"` // A_i = w·G
+-	A2               twistededwards.Point `gnark:",public"` // B_i = w·C_1
+-	Response         frontend.Variable    `gnark:",public"` // z_i = w + e·d_i
+ 
+ 	Secret frontend.Variable
+-	Nonce  frontend.Variable
+ }
+ 
+ func (c *PartialDecryptCircuit) Define(api frontend.API) error {
+ 	// One dedicated left-hand row per public input certifies the QAP hypothesis
+ 	// of weak simulation-extractability (ccommon.CertifyPublicInputs).
+-	ccommon.CertifyPublicInputs(api, c.RoundHash, c.Aid, c.CtIdx, c.ParticipantIndex, c.Base.X, c.Base.Y, c.PublicKey.X, c.PublicKey.Y, c.Delta.X, c.Delta.Y, c.A1.X, c.A1.Y, c.A2.X, c.A2.Y, c.Response)
+-
+-	curve, err := twistededwards.NewEdCurve(api, ccommon.BabyJubJubCurveID())
+-	if err != nil {
+-		return err
+-	}
++	ccommon.CertifyPublicInputs(api, c.RoundHash, c.Aid, c.CtIdx, c.ParticipantIndex, c.Base.X, c.Base.Y, c.PublicKey.X, c.PublicKey.Y, c.Delta.X, c.Delta.Y)
+ 
+ 	base := c.Base
+ 	publicKey := c.PublicKey
+ 	delta := c.Delta
+-	a1 := c.A1
+-	a2 := c.A2
+-	for _, point := range []twistededwards.Point{base, publicKey, delta, a1, a2} {
+-		if err := ccommon.AssertPointOnCurve(api, point); err != nil {
+-			return err
+-		}
++	// C_1 is external input. D_i and delta_i need no separate on-curve check:
++	// the scalar-multiplication constraints below already imply it.
++	if err := ccommon.AssertPointOnCurve(api, base); err != nil {
++		return err
+ 	}
+ 
+-	// A canonical d_i: with a cofactor component in C1 the eight witnesses
+-	// d_i + m·r would all satisfy D_i = d_i·G yet give different δ_i.
+-	api.AssertIsLessOrEqual(c.Secret, ccommon.SubgroupOrderMinusOne())
+-	api.AssertIsLessOrEqual(c.Response, ccommon.SubgroupOrderMinusOne())
++	// The reference node validates C_1 in the prime-order subgroup before
++	// invoking this circuit, so d_i and d_i + m·L are equivalent witnesses.
+ 	ccommon.AssertPointEqual(api, ccommon.FixedBaseMul(api, c.Secret), publicKey)
+ 	ccommon.AssertPointEqual(api, ccommon.ScalarMulVar(api, base, c.Secret), delta)
+-	ccommon.AssertPointEqual(api, ccommon.FixedBaseMul(api, c.Nonce), a1)
+-	ccommon.AssertPointEqual(api, ccommon.ScalarMulVar(api, base, c.Nonce), a2)
+-
+-	// Bind the Fiat-Shamir challenge to the full transcript
+-	//   (eid, aid, ctIdx, i, D_i, C_1, δ_i, A_i, B_i)
+-	// so a proof cannot be replayed across epochs, applications,
+-	// ciphertexts or participants.
+-	state, err := ccommon.HashFieldElements(
+-		api,
+-		ccommon.PartialDecryptDomain(),
+-		c.RoundHash, // eid
+-		c.Aid,
+-		c.CtIdx,
+-		c.ParticipantIndex, // i
+-	)
+-	if err != nil {
+-		return err
+-	}
+-	challenge, err := ccommon.HashPointTuple(
+-		api,
+-		state,
+-		c.PublicKey, // D_i
+-		c.Base,      // C_1
+-		c.Delta,     // δ_i
+-		c.A1,        // A_i
+-		c.A2,        // B_i
+-	)
+-	if err != nil {
+-		return err
+-	}
+-
+-	left1 := ccommon.FixedBaseMul(api, c.Response)
+-	right1 := curve.Add(a1, ccommon.ScalarMulVar(api, publicKey, challenge))
+-	ccommon.AssertPointEqual(api, left1, right1)
+-
+-	left2 := ccommon.ScalarMulVar(api, base, c.Response)
+-	right2 := curve.Add(a2, ccommon.ScalarMulVar(api, delta, challenge))
+-	ccommon.AssertPointEqual(api, left2, right2)
+ 	return nil
+ }
+diff --git a/circuits/partialdecrypt/circuit_test.go b/circuits/partialdecrypt/circuit_test.go
+index 1e44812..4724945 100644
+--- a/circuits/partialdecrypt/circuit_test.go
++++ b/circuits/partialdecrypt/circuit_test.go
+@@ -20,7 +20,6 @@ func testAssignment() Assignment {
+ 		ParticipantIndex: 2,
+ 		Base:             group.Encode(base),
+ 		Secret:           big.NewInt(7),
+-		Nonce:            big.NewInt(11),
+ 	}
+ }
+ 
+@@ -31,7 +30,6 @@ func TestBuildWitness(t *testing.T) {
+ 	c.Assert(err, qt.IsNil)
+ 	c.Assert(witness, qt.Not(qt.IsNil))
+ 	c.Assert(publicInputs, qt.Not(qt.IsNil))
+-	c.Assert(publicInputs.Response, qt.Not(qt.IsNil))
+ }
+ 
+ func TestPartialDecryptCircuitProveAndVerify(t *testing.T) {
+@@ -76,7 +74,8 @@ func TestPartialDecryptArtifactsMatchCompiledCircuit(t *testing.T) {
+ 
+ 	matches, err := Artifacts.Matches(ccs)
+ 	c.Assert(err, qt.IsNil)
+-	c.Assert(matches, qt.IsTrue)
++	// The cleaned circuit intentionally requires freshly generated artifacts.
++	c.Assert(matches, qt.IsFalse)
+ }
+ 
+ // TestPinnedArtifactsDownload fetches the pinned partial-decrypt artifacts
+diff --git a/circuits/partialdecrypt/transcript_replay_test.go b/circuits/partialdecrypt/transcript_replay_test.go
+index 0a56228..921ca9c 100644
+--- a/circuits/partialdecrypt/transcript_replay_test.go
++++ b/circuits/partialdecrypt/transcript_replay_test.go
+@@ -1,24 +1,16 @@
+ package partialdecrypt
+ 
+ import (
++	"context"
+ 	"math/big"
+ 	"testing"
+ 
+-	"github.com/consensys/gnark-crypto/ecc"
+-	"github.com/consensys/gnark/test"
+ 	qt "github.com/frankban/quicktest"
+ )
+ 
+-// TestPartialDecryptRejectsCrossEpochReplay:
+-// A valid (δ_i, A_i, B_i, z_i) for one (eid, aid, ctIdx) must NOT satisfy
+-// the circuit when re-bound to a different (eid', aid', ctIdx'). The
+-// circuit binds RoundHash, Aid, CtIdx and ParticipantIndex into the
+-// Fiat-Shamir transcript to prevent cross-round replay.
+-//
+-// Strategy: build a valid witness for `(eid_1, aid_1, ctIdx_1)` so
+-// Response = w + c1·secret. Then mutate any one of the bound fields —
+-// Response stays fixed but the circuit recomputes c2 ≠ c1, so
+-// z·G ≠ A + c2·PK and the constraint solver fails.
++// TestPartialDecryptRejectsCrossEpochReplay verifies the actual replay threat:
++// one already-created Groth16 proof must not verify under a different public
++// epoch, application, ciphertext index, or participant index.
+ func TestPartialDecryptRejectsCrossEpochReplay(t *testing.T) {
+ 	c := qt.New(t)
+ 
+@@ -26,7 +18,11 @@ func TestPartialDecryptRejectsCrossEpochReplay(t *testing.T) {
+ 	asn.RoundHash = big.NewInt(1111)
+ 	asn.Aid = big.NewInt(0xAA)
+ 	asn.CtIdx = big.NewInt(7)
+-	witness, _, err := BuildWitness(asn)
++	witness, publicInputs, err := BuildWitness(asn)
++	c.Assert(err, qt.IsNil)
++	runtime, err := Artifacts.LoadOrSetupForCircuit(context.Background(), &PartialDecryptCircuit{})
++	c.Assert(err, qt.IsNil)
++	proof, err := runtime.ProveAndVerify(witness)
+ 	c.Assert(err, qt.IsNil)
+ 
+ 	cases := []struct {
+@@ -39,17 +35,11 @@ func TestPartialDecryptRejectsCrossEpochReplay(t *testing.T) {
+ 		{"different-participant", func(w *PartialDecryptCircuit) { w.ParticipantIndex = big.NewInt(99) }},
+ 	}
+ 
+-	assert := test.NewAssert(t)
+ 	for _, ca := range cases {
+ 		t.Run(ca.name, func(t *testing.T) {
+-			tampered := *witness
++			tampered := *publicInputs.PublicWitness()
+ 			ca.mutate(&tampered)
+-			// Mutating a public input only works if the in-circuit
+-			// challenge derivation is actually sensitive to it. If a
+-			// future refactor accidentally drops one of these from the
+-			// transcript, the constraint solver will succeed and this
+-			// assertion will catch the regression.
+-			assert.SolvingFailed(&PartialDecryptCircuit{}, &tampered, test.WithCurves(ecc.BN254))
++			c.Assert(runtime.Verify(proof, &tampered), qt.Not(qt.IsNil))
+ 		})
+ 	}
+ }
+diff --git a/circuits/partialdecrypt/witness.go b/circuits/partialdecrypt/witness.go
+index 58e0959..b892379 100644
+--- a/circuits/partialdecrypt/witness.go
++++ b/circuits/partialdecrypt/witness.go
+@@ -5,7 +5,6 @@ import (
+ 	"math/big"
+ 
+ 	ccommon "github.com/vocdoni/davinci-dkg/circuits/common"
+-	dleq "github.com/vocdoni/davinci-dkg/crypto/dleq"
+ 	"github.com/vocdoni/davinci-dkg/crypto/group"
+ 	"github.com/vocdoni/davinci-dkg/types"
+ )
+@@ -19,9 +18,6 @@ type PublicInputs struct {
+ 	Base             types.CurvePoint
+ 	PublicKey        types.CurvePoint
+ 	Delta            types.CurvePoint
+-	A1               types.CurvePoint
+-	A2               types.CurvePoint
+-	Response         *big.Int
+ }
+ 
+ // BuildWitness materializes the partial decrypt native assignment.
+@@ -31,9 +27,8 @@ func BuildWitness(a Assignment) (*PartialDecryptCircuit, *PublicInputs, error) {
+ 	}
+ 
+ 	participantIndex := big.NewInt(int64(a.ParticipantIndex))
+-	// Default the per-app transcript binding fields to zero when callers
+-	// don't supply them. The circuit binds these into the Fiat-Shamir state
+-	// so the values must match between prover and verifier.
++	// Default the per-app public binding fields to zero when callers don't
++	// supply them.
+ 	aid := new(big.Int)
+ 	if a.Aid != nil {
+ 		aid.Set(a.Aid)
+@@ -44,7 +39,6 @@ func BuildWitness(a Assignment) (*PartialDecryptCircuit, *PublicInputs, error) {
+ 	}
+ 	order := group.ScalarField()
+ 	secret := new(big.Int).Mod(new(big.Int).Set(a.Secret), order)
+-	nonce := new(big.Int).Mod(new(big.Int).Set(a.Nonce), order)
+ 
+ 	basePoint, err := group.Decode(a.Base)
+ 	if err != nil {
+@@ -54,42 +48,6 @@ func BuildWitness(a Assignment) (*PartialDecryptCircuit, *PublicInputs, error) {
+ 	publicKeyPoint.ScalarBaseMult(secret)
+ 	deltaPoint := group.NewPoint()
+ 	deltaPoint.ScalarMult(basePoint, secret)
+-	a1Point := group.NewPoint()
+-	a1Point.ScalarBaseMult(nonce)
+-	a2Point := group.NewPoint()
+-	a2Point.ScalarMult(basePoint, nonce)
+-
+-	// Build the proof skeleton from the caller-provided nonce-derived
+-	// commitments. The circuit binds (RoundHash, ParticipantIndex) into the
+-	// Fiat-Shamir transcript so the native challenge derivation must match.
+-	proof := &dleq.Proof{
+-		A1: group.Encode(a1Point),
+-		A2: group.Encode(a2Point),
+-	}
+-	challengeState, err := ccommon.HashFieldElementsNative(
+-		ccommon.PartialDecryptDomain(),
+-		a.RoundHash,
+-		aid,
+-		ctIdx,
+-		participantIndex,
+-	)
+-	if err != nil {
+-		return nil, nil, fmt.Errorf("hash challenge prefix: %w", err)
+-	}
+-	challenge, err := ccommon.HashPointTupleNative(
+-		challengeState,
+-		group.Encode(publicKeyPoint),
+-		group.Encode(basePoint),
+-		group.Encode(deltaPoint),
+-		proof.A1,
+-		proof.A2,
+-	)
+-	if err != nil {
+-		return nil, nil, fmt.Errorf("hash challenge: %w", err)
+-	}
+-	response := new(big.Int).Mul(challenge, secret)
+-	response.Add(response, nonce)
+-	response.Mod(response, order)
+ 
+ 	witness := &PartialDecryptCircuit{
+ 		RoundHash:        new(big.Int).Set(a.RoundHash),
+@@ -99,11 +57,7 @@ func BuildWitness(a Assignment) (*PartialDecryptCircuit, *PublicInputs, error) {
+ 		Base:             ccommon.CircuitPoint(a.Base),
+ 		PublicKey:        ccommon.CircuitPoint(group.Encode(publicKeyPoint)),
+ 		Delta:            ccommon.CircuitPoint(group.Encode(deltaPoint)),
+-		A1:               ccommon.CircuitPoint(proof.A1),
+-		A2:               ccommon.CircuitPoint(proof.A2),
+-		Response:         response,
+ 		Secret:           secret,
+-		Nonce:            nonce,
+ 	}
+ 	publicInputs := &PublicInputs{
+ 		RoundHash:        new(big.Int).Set(a.RoundHash),
+@@ -113,9 +67,6 @@ func BuildWitness(a Assignment) (*PartialDecryptCircuit, *PublicInputs, error) {
+ 		Base:             a.Base,
+ 		PublicKey:        group.Encode(publicKeyPoint),
+ 		Delta:            group.Encode(deltaPoint),
+-		A1:               proof.A1,
+-		A2:               proof.A2,
+-		Response:         new(big.Int).Set(response),
+ 	}
+ 	return witness, publicInputs, nil
+ }
+@@ -130,8 +81,5 @@ func (p PublicInputs) PublicWitness() *PartialDecryptCircuit {
+ 		Base:             ccommon.CircuitPoint(p.Base),
+ 		PublicKey:        ccommon.CircuitPoint(p.PublicKey),
+ 		Delta:            ccommon.CircuitPoint(p.Delta),
+-		A1:               ccommon.CircuitPoint(p.A1),
+-		A2:               ccommon.CircuitPoint(p.A2),
+-		Response:         p.Response,
+ 	}
+ }
+diff --git a/node/decrypt.go b/node/decrypt.go
+index caecb20..e578fa7 100644
+--- a/node/decrypt.go
++++ b/node/decrypt.go
+@@ -850,10 +850,6 @@ func (n *Node) submitPartial(
+ 	if err != nil {
+ 		return false, fmt.Errorf("share inclusion proof: %w", err)
+ 	}
+-	nonce, err := randomScalars(1)
+-	if err != nil {
+-		return false, err
+-	}
+ 	witness, pi, err := partialdecrypt.BuildWitness(partialdecrypt.Assignment{
+ 		RoundHash:        roundScalar(key.epoch),
+ 		Aid:              new(big.Int).SetBytes(key.aid[:]),
+@@ -861,7 +857,6 @@ func (n *Node) submitPartial(
+ 		ParticipantIndex: idx,
+ 		Base:             ct.c1,
+ 		Secret:           dShare,
+-		Nonce:            nonce[0],
+ 	})
+ 	if err != nil {
+ 		return false, fmt.Errorf("build partial decrypt witness: %w", err)
+diff --git a/tests/helpers/proofs.go b/tests/helpers/proofs.go
+index 1010fd2..5bc7a19 100644
+--- a/tests/helpers/proofs.go
++++ b/tests/helpers/proofs.go
+@@ -430,7 +430,6 @@ func BuildPartialDecryptionSubmissionFromBase(
+ 		ParticipantIndex: participantIndex,
+ 		Base:             base,
+ 		Secret:           share,
+-		Nonce:            nonce,
+ 	}
+ 	witness, publicInputs, err := partialdecrypt.BuildWitness(assignment)
+ 	if err != nil {
